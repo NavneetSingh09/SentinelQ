@@ -1,7 +1,7 @@
 import redis
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from shared.models import Job, JobStatus
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -16,9 +16,9 @@ def get_redis() -> redis.Redis:
     return _client
 
 
-def set_job_status(job_id: str, status: JobStatus, worker_id: str = None, error: str = None):
+def set_job_status(job_id: str, status: JobStatus, worker_id: str = None, error: str = None) -> None:
     r = get_redis()
-    data = {"status": status.value}
+    data: dict = {"status": status.value}
     if worker_id:
         data["worker_id"] = worker_id
     if error:
@@ -38,14 +38,14 @@ def acquire_lock(job_id: str, worker_id: str, ttl_seconds: int = 60) -> bool:
     return r.set(f"lock:{job_id}", worker_id, nx=True, ex=ttl_seconds)
 
 
-def release_lock(job_id: str, worker_id: str):
+def release_lock(job_id: str, worker_id: str) -> None:
     r = get_redis()
     current = r.get(f"lock:{job_id}")
     if current == worker_id:
         r.delete(f"lock:{job_id}")
 
 
-def cache_job(job: Job):
+def cache_job(job: Job) -> None:
     """Cache full job object for fast status lookups."""
     r = get_redis()
     r.setex(f"jobdata:{job.id}", int(timedelta(hours=1).total_seconds()), job.model_dump_json())
@@ -59,9 +59,33 @@ def get_cached_job(job_id: str) -> Job | None:
     return None
 
 
-def increment_metrics(topic: str):
+def check_dedup(alert_name: str, source: str) -> str | None:
+    """Return existing job_id if a duplicate exists within 60s window, else None."""
     r = get_redis()
-    r.incr(f"metrics:total_processed")
+    return r.get(f"dedup:{alert_name}:{source}")
+
+
+def set_dedup(alert_name: str, source: str, job_id: str) -> None:
+    """Set dedup key with 60s TTL to prevent duplicate alert submissions."""
+    r = get_redis()
+    r.setex(f"dedup:{alert_name}:{source}", 60, job_id)
+
+
+def publish_job_update(job_id: str, status: str, worker_id: str | None = None) -> None:
+    """Publish a job status change to Redis pub/sub channel for WebSocket clients."""
+    r = get_redis()
+    message = json.dumps({
+        "job_id": job_id,
+        "status": status,
+        "worker_id": worker_id,
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+    r.publish("job:updates", message)
+
+
+def increment_metrics(topic: str) -> None:
+    r = get_redis()
+    r.incr("metrics:total_processed")
     r.incr(f"metrics:topic:{topic}")
 
 

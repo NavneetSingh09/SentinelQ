@@ -14,7 +14,7 @@ from shared.models import Job, JobStatus, Priority, TOPICS
 from shared.database import SessionLocal, JobRecord, init_db
 from shared.state import (
     set_job_status, acquire_lock, release_lock,
-    increment_metrics, cache_job
+    increment_metrics, cache_job, publish_job_update,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -34,18 +34,17 @@ consumer = Consumer({
     "bootstrap.servers": KAFKA_SERVERS,
     "group.id": "sentinelq-workers",
     "auto.offset.reset": "earliest",
-    "enable.auto.commit": False,       # manual commit after processing
+    "enable.auto.commit": False,
 })
 
 producer = Producer({"bootstrap.servers": KAFKA_SERVERS})
 
 
-# ── Job Handlers (simulate real alert processing) ────────────────────────────
+# ── Job handlers (simulate real integrations) ─────────────────────────────────
 
 def handle_critical(job: Job) -> bool:
     log.info(f"[CRITICAL] Processing {job.alert_name} — paging on-call engineer")
     time.sleep(0.5)
-    # Simulate occasional failure for retry testing
     if random.random() < 0.1:
         raise Exception("PagerDuty webhook timeout")
     return True
@@ -79,27 +78,22 @@ HANDLERS = {
 }
 
 
-# ── Retry logic ──────────────────────────────────────────────────────────────
+# ── Retry logic ───────────────────────────────────────────────────────────────
 
 def exponential_backoff(retry_count: int) -> float:
-    """2^n seconds with jitter, capped at 60s."""
-    delay = min(60, (2 ** retry_count) + random.uniform(0, 1))
-    return delay
+    """2^n seconds with jitter, capped at 60 s."""
+    return min(60.0, (2 ** retry_count) + random.uniform(0, 1))
 
 
-def send_to_dead_letter(job: Job, error: str):
+def send_to_dead_letter(job: Job, error: str) -> None:
     job.status = JobStatus.DEAD
     job.error = error
-    producer.produce(
-        TOPICS["dead_letter"],
-        key=job.id,
-        value=job.to_kafka_message()
-    )
+    producer.produce(TOPICS["dead_letter"], key=job.id, value=job.to_kafka_message())
     producer.flush()
-    log.warning(f"Job {job.id} sent to dead-letter queue after {job.retry_count} retries")
+    log.warning(f"Job {job.id} sent to dead-letter after {job.retry_count} retries")
 
 
-def update_db(job: Job, db: Session):
+def update_db(job: Job, db: Session) -> None:
     record = db.query(JobRecord).filter(JobRecord.id == job.id).first()
     if record:
         record.status = job.status.value
@@ -112,7 +106,17 @@ def update_db(job: Job, db: Session):
 
 # ── Main consume loop ─────────────────────────────────────────────────────────
 
-def process_message(msg):
+def _transition(job: Job, status: JobStatus, db: Session, error: str = None) -> None:
+    """Update job status in Redis, PostgreSQL, and broadcast to WebSocket clients."""
+    job.status = status
+    if error:
+        job.error = error
+    set_job_status(job.id, status, worker_id=job.worker_id, error=error)
+    publish_job_update(job.id, status.value, job.worker_id)
+    update_db(job, db)
+
+
+def process_message(msg) -> None:
     db = SessionLocal()
     try:
         job = Job.from_kafka_message(msg.value().decode("utf-8"))
@@ -121,63 +125,49 @@ def process_message(msg):
 
         log.info(f"Worker {WORKER_ID} picked up job {job.id} [{job.priority.value}] from {topic}")
 
-        # Distributed lock — skip if another worker already claimed it
         if not acquire_lock(job.id, WORKER_ID):
             log.info(f"Job {job.id} already locked by another worker, skipping")
             return
 
         try:
-            set_job_status(job.id, JobStatus.RUNNING, worker_id=WORKER_ID)
-            job.status = JobStatus.RUNNING
-            update_db(job, db)
+            _transition(job, JobStatus.RUNNING, db)
 
             handler = HANDLERS.get(job.priority, handle_normal)
             handler(job)
 
-            job.status = JobStatus.DONE
-            set_job_status(job.id, JobStatus.DONE, worker_id=WORKER_ID)
-            update_db(job, db)
+            _transition(job, JobStatus.DONE, db)
             increment_metrics(topic)
             log.info(f"Job {job.id} completed successfully")
 
-        except Exception as e:
-            error_msg = str(e)
+        except Exception as exc:
+            error_msg = str(exc)
             job.retry_count += 1
             log.error(f"Job {job.id} failed (attempt {job.retry_count}/{job.max_retries}): {error_msg}")
 
             if job.retry_count >= job.max_retries:
-                job.status = JobStatus.DEAD
-                job.error = error_msg
-                set_job_status(job.id, JobStatus.DEAD, error=error_msg)
-                update_db(job, db)
+                _transition(job, JobStatus.DEAD, db, error=error_msg)
                 send_to_dead_letter(job, error_msg)
             else:
                 delay = exponential_backoff(job.retry_count)
                 log.info(f"Retrying job {job.id} in {delay:.1f}s")
-                job.status = JobStatus.RETRYING
-                job.error = error_msg
-                set_job_status(job.id, JobStatus.RETRYING, error=error_msg)
-                update_db(job, db)
-
+                _transition(job, JobStatus.RETRYING, db, error=error_msg)
                 time.sleep(delay)
-
-                # Requeue to same priority topic
                 producer.produce(topic, key=job.id, value=job.to_kafka_message())
                 producer.flush()
 
         finally:
             release_lock(job.id, WORKER_ID)
 
-    except Exception as e:
-        log.error(f"Fatal error processing message: {e}")
+    except Exception as exc:
+        log.error(f"Fatal error processing message: {exc}")
     finally:
         db.close()
 
 
-def run():
+def run() -> None:
     init_db()
     consumer.subscribe(SUBSCRIBE_TOPICS)
-    log.info(f"Worker {WORKER_ID} started. Subscribed to: {SUBSCRIBE_TOPICS}")
+    log.info(f"Worker {WORKER_ID} started — subscribed to: {SUBSCRIBE_TOPICS}")
 
     try:
         while True:
