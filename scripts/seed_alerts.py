@@ -59,9 +59,9 @@ def main():
         worker = data.get("worker_id", "-")
         print(f"{job_id[:8]}... status={status:10} worker={worker}")
 
-    print("\n=== Metrics ===")
-    metrics = httpx.get(f"{BASE_URL}/metrics").json()
-    for k, v in sorted(metrics.items()):
+    print("\n=== Stats ===")
+    stats = httpx.get(f"{BASE_URL}/stats").json()
+    for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
 
